@@ -15,13 +15,22 @@ namespace fu
     public:
       PolySock();
       virtual ~PolySock();
+      void run();
+      void wait();
       bool start();
       bool stop();
       bool push(int tag, MonoSock* sock);
-      MonoSock* pull(int tag);
-      bool pull(MonoSock* sock);
+      MonoSock* pop(int tag);
+      bool pop(MonoSock* sock);
+      void pop();
     private:
+      bool start(MonoSock* sock);
+      bool stop(MonoSock* sock);
       std::map<int, MonoSock*> socks;
+      std::condition_variable condition;
+      std::mutex mutex;
+      bool isStarted;
+      ThreadPool* threads;
   };
 }
 
