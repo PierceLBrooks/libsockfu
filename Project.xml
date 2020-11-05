@@ -55,7 +55,9 @@
 					</git_repo>
 				</remote>
 				<build>
-					<arguments></arguments>
+					<arguments>
+						<argument>-DBUILD_SHARED_LIBS=true</argument>
+					</arguments>
 					<cmake>
 						<generator>
 							<switch id="BUILDSTER_OS">
@@ -104,6 +106,10 @@
 						<link>gdi32</link>
 						<link>crypt32</link>
 						<link>ws2_32</link>
+					</if_check>
+					<if_check id="BUILDSTER_OS" check="Linux">
+						<link>pthread</link>
+						<link>dl</link>
 					</if_check>
 				</links>
 				<imports>
