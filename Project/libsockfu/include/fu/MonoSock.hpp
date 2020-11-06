@@ -16,12 +16,14 @@ namespace fu
   class MonoSock
   {
     public:
-      typedef std::function<void()> ConnectCallback;
+      typedef std::function<void()> DisconnectCallback;
+      typedef std::function<bool(const std::string& address)> ConnectCallback;
       typedef std::function<void(const uint8_t*, size_t)> ReceiveCallback;
       enum Role
       {
         Server,
         Client,
+        Listener,
       };
       enum Protocol
       {
@@ -34,24 +36,41 @@ namespace fu
       bool connect();
       bool listen();
       bool send(const uint8_t* bytes, size_t length);
+      void setDisconnectCallback(DisconnectCallback callback);
       void setConnectCallback(ConnectCallback callback);
       void setReceiveCallback(ReceiveCallback callback);
     private:
       friend class PolySock;
       bool accept(int status);
       bool establish(int status);
+      bool establish(const std::string& address, int status);
+      bool establish(const struct sockaddr_storage* address, int status);
+      bool idle();
+      void read();
+      void write();
       Role role;
       Protocol protocol;
-      ConnectCallback connectCallback;
-      ReceiveCallback receiveCallback;
       int tag;
       int port;
       bool isConnected;
+      bool isIdle;
       uv_tcp_t* tcp;
       uv_loop_t* loop;
       uv_connect_t* connection;
       std::vector<uv_tcp_t*> tcpAccepts;
+      std::condition_variable conditionRead;
+      std::condition_variable conditionWrite;
+      std::mutex mutexWrite;
+      std::mutex mutexRead;
+    protected:
+      std::string peer;
+      std::vector<MonoSock*> children;
+      MonoSock* parent;
+      PolySock* owner;
       ThreadPool* threads;
+      DisconnectCallback disconnectCallback;
+      ConnectCallback connectCallback;
+      ReceiveCallback receiveCallback;
   };
 }
 

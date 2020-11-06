@@ -30,11 +30,14 @@ bool fu::PolySock::start(MonoSock* sock)
   bool success = false;
   switch (sock->role)
   {
-  case MonoSock::Role::Server:
+  case MonoSock::Role::Listener:
     success = sock->listen();
     break;
   case MonoSock::Role::Client:
     success = sock->connect();
+    break;
+  case MonoSock::Role::Server:
+    success = sock->idle();
     break;
   }
   return success;
@@ -56,11 +59,16 @@ bool fu::PolySock::start()
     return false;
   }
   isStarted = true;
-  threads->enqueue(0, [](PolySock* that){that->run();}, this);
+  threads->enqueue(0, "Run", [](PolySock* that){that->run();}, this);
   for (auto i = socks.begin(); i != socks.end(); i++)
   {
+    if (i->second->role == MonoSock::Role::Server)
+    {
+      continue;
+    }
     if (!start(i->second))
     {
+      std::cout << i->second->tag << std::endl;
       return false;
     }
   }
@@ -86,14 +94,15 @@ void fu::PolySock::wait()
 {
   while (isStarted)
   {
+    //std::cout << "wait" << std::endl;
     std::chrono::milliseconds timespan(100);
     std::unique_lock<std::mutex> lock(mutex);
-    condition.wait_for(lock, timespan, [this]{return !this->isStarted;});
+    condition.wait(lock, [this]{return !this->isStarted;});
     if (!isStarted)
     {
       break;
     }
-    std::this_thread::sleep_for(timespan);
+    //std::this_thread::sleep_for(timespan);
   }
 }
 
@@ -101,24 +110,39 @@ void fu::PolySock::run()
 {
   while (isStarted)
   {
+    //std::cout << "run" << std::endl;
     std::chrono::milliseconds timespan(100);
     if (socks.empty())
     {
       stop();
       break;
     }
-    std::this_thread::sleep_for(timespan);
+    //std::this_thread::sleep_for(timespan);
   }
 }
 
 bool fu::PolySock::push(int tag, MonoSock* sock)
 {
+  std::cout << "push" << std::endl;
+  if (sock == nullptr)
+  {
+    return false;
+  }
   auto i = socks.find(tag);
   if (i != socks.end())
   {
     return false;
   }
   sock->tag = tag;
+  sock->owner = this;
+  if (isStarted)
+  {
+    if (!start(sock))
+    {
+      sock->owner = nullptr;
+      return false;
+    }
+  }
   socks[tag] = sock;
   return true;
 }
@@ -134,6 +158,7 @@ bool fu::PolySock::pop(MonoSock* sock)
   {
     return false;
   }
+  i->second->owner = nullptr;
   socks.erase(i);
   return true;
 }
@@ -146,12 +171,15 @@ fu::MonoSock* fu::PolySock::pop(int tag)
     return nullptr;
   }
   MonoSock* sock = i->second;
+  sock->owner = nullptr;
   socks.erase(i);
   return sock;
 }
 
 void fu::PolySock::pop()
 {
+  std::cout << "pop" << std::endl;
+  condition.notify_all();
   while (!socks.empty())
   {
     MonoSock* sock = pop(socks.begin()->first);

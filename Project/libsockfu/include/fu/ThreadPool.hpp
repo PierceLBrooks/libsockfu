@@ -32,6 +32,8 @@ THIS IS AN ALTERED SOURCE VERSION!!!
 #ifndef FU_THREAD_POOL_HPP
 #define FU_THREAD_POOL_HPP
 
+#include <string>
+#include <iostream>
 #include <vector>
 #include <memory>
 #include <thread>
@@ -269,14 +271,19 @@ namespace fu
     {
         public:
             template <typename ...Args>
-            Task(unsigned int priority, Args&& ...args) : priority(priority), task(std::function<void()>(std::forward<Args>(args)...)) {}
+            Task(unsigned int priority, const std::string& name, Args&& ...args) : priority(priority), name(name), task(std::function<void()>(std::forward<Args>(args)...)) {}
             unsigned int getPriority() const
             {
                 return priority;
             }
+            const std::string& getName() const
+            {
+                return name;
+            }
             std::function<void()> task;
         private:
             unsigned int priority;
+            std::string name;
     };
 
     template <class T>
@@ -310,6 +317,7 @@ namespace fu
                                 }
                                 if (task != nullptr)
                                 {
+                                    std::cout << task->getName() << std::endl;
                                     task->task();
                                     delete task;
                                 }
@@ -339,7 +347,7 @@ namespace fu
                 this->purge();
             }
             template<class F, class... Args>
-            auto enqueue(unsigned int priority, F&& f, Args&&... args)
+            auto enqueue(unsigned int priority, const std::string& name, F&& f, Args&&... args)
                 -> std::future<typename std::result_of<F(Args...)>::type>
             {
                 using returnType = typename std::result_of<F(Args...)>::type;
@@ -352,7 +360,7 @@ namespace fu
                         std::string error = "ERROR: Cannot enqueue on a Thread Pool which has already been shut down!";
                         throw std::runtime_error(error);
                     }
-                    this->push(new T(priority,[task]{(*task)();}));
+                    this->push(new T(priority,name,[task]{(*task)();}));
                 }
                 condition.notify_one();
                 return result;
