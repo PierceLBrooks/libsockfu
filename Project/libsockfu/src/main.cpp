@@ -29,10 +29,10 @@ int main()
   poly = new fu::PolySock();
   fu::MonoSock* monoCli = new fu::MonoSock(fu::MonoSock::Role::Client, fu::MonoSock::Protocol::TCP, 9009);
   fu::MonoSock* monoSer = new fu::MonoSock(fu::MonoSock::Role::Listener, fu::MonoSock::Protocol::TCP, 9009);
-  monoCli->setDisconnectCallback([&](){std::cout << "disconnect" << std::endl;});
-  monoCli->setConnectCallback([&](const std::string& address){std::string str = "Hello, world!";monoCli->send(reinterpret_cast<const uint8_t*>(str.c_str()), str.length());return true;});
-  monoCli->setReceiveCallback([&](const uint8_t* bytes, size_t length){std::cout << std::string(reinterpret_cast<const char*>(bytes), length) << std::endl;poly->pop();});
-  monoSer->setReceiveCallback([&](const uint8_t* bytes, size_t length){std::cout << std::string(reinterpret_cast<const char*>(bytes), length) << std::endl;monoCli->send(bytes, length);});
+  monoCli->setDisconnectCallback([&](fu::MonoSock* sock){std::cout << "disconnect" << std::endl;});
+  monoCli->setConnectCallback([&](fu::MonoSock* sock, const std::string& address){std::string str = "Hello, world!";sock->send(reinterpret_cast<const uint8_t*>(str.c_str()), str.length());return true;});
+  monoCli->setReceiveCallback([&](fu::MonoSock* sock, const uint8_t* bytes, size_t length){std::cout << std::string(reinterpret_cast<const char*>(bytes), length) << std::endl;poly->pop();});
+  monoSer->setReceiveCallback([&](fu::MonoSock* sock, const uint8_t* bytes, size_t length){std::cout << std::string(reinterpret_cast<const char*>(bytes), length) << std::endl;sock->send(bytes, length);});
   poly->push(1, monoSer);
   poly->push(2, monoCli);
   monoCli = nullptr;

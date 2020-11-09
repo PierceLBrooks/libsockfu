@@ -16,9 +16,9 @@ namespace fu
   class MonoSock
   {
     public:
-      typedef std::function<void()> DisconnectCallback;
-      typedef std::function<bool(const std::string& address)> ConnectCallback;
-      typedef std::function<void(const uint8_t*, size_t)> ReceiveCallback;
+      typedef std::function<void(MonoSock* sock)> DisconnectCallback;
+      typedef std::function<bool(MonoSock* sock, const std::string& address)> ConnectCallback;
+      typedef std::function<void(MonoSock* sock, const uint8_t* bytes, size_t length)> ReceiveCallback;
       enum Role
       {
         Server,
@@ -35,12 +35,15 @@ namespace fu
       bool disconnect();
       bool connect();
       bool listen();
+      bool receive(const uint8_t* bytes, ssize_t length);
       bool send(const uint8_t* bytes, size_t length);
       void setDisconnectCallback(DisconnectCallback callback);
       void setConnectCallback(ConnectCallback callback);
       void setReceiveCallback(ReceiveCallback callback);
     private:
       friend class PolySock;
+      void close(uv_handle_t* handle);
+      bool wrote(uv_write_t* writer, int status);
       bool accept(int status);
       bool establish(int status);
       bool establish(const std::string& address, int status);
@@ -50,6 +53,7 @@ namespace fu
       void write();
       Role role;
       Protocol protocol;
+      int index;
       int tag;
       int port;
       bool isConnected;
@@ -57,13 +61,14 @@ namespace fu
       uv_tcp_t* tcp;
       uv_loop_t* loop;
       uv_connect_t* connection;
-      std::vector<uv_tcp_t*> tcpAccepts;
       std::condition_variable conditionRead;
       std::condition_variable conditionWrite;
       std::mutex mutexWrite;
       std::mutex mutexRead;
     protected:
+      uv_buf_t allocate(size_t length);
       std::string peer;
+      std::vector<uv_tcp_t*> tcpAccepts;
       std::vector<MonoSock*> children;
       MonoSock* parent;
       PolySock* owner;

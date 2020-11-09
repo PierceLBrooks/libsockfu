@@ -18,10 +18,13 @@ fu::MonoSock::MonoSock(Role role, Protocol protocol, int port) :
   tcp = nullptr;
   connection = nullptr;
   owner = nullptr;
+  parent = nullptr;
   peer = "127.0.0.1";
-  connectCallback = [](const std::string& address){return true;};
-  disconnectCallback = [](){};
-  receiveCallback = [](const uint8_t* bytes, size_t length){};
+  tag = 0;
+  index = -1;
+  connectCallback = [](MonoSock* sock, const std::string& address){return true;};
+  disconnectCallback = [](MonoSock* sock){};
+  receiveCallback = [](MonoSock* sock, const uint8_t* bytes, size_t length){};
 }
 
 fu::MonoSock::~MonoSock()
@@ -47,18 +50,16 @@ bool fu::MonoSock::disconnect()
   }
   for (auto i = tcpAccepts.begin(); i != tcpAccepts.end(); i++)
   {
-    uv_close((uv_handle_t*)(*i), nullptr);
+    uv_close((uv_handle_t*)(*i), [](uv_handle_t* handle){static_cast<MonoSock*>(handle->data)->close(handle);});
     std::chrono::milliseconds timespan(100);
     std::this_thread::sleep_for(timespan);
-    delete *i;
   }
   tcpAccepts.clear();
   if (tcp != nullptr)
   {
-    uv_close((uv_handle_t*)tcp, nullptr);
+    uv_close((uv_handle_t*)tcp, [](uv_handle_t* handle){static_cast<MonoSock*>(handle->data)->close(handle);});
     std::chrono::milliseconds timespan(100);
     std::this_thread::sleep_for(timespan);
-    delete tcp;
     tcp = nullptr;
   }
   if (connection != nullptr)
@@ -163,6 +164,25 @@ MonoSock_listen_END:
   return true;
 }
 
+uv_buf_t fu::MonoSock::allocate(size_t length)
+{
+  if (parent != nullptr)
+  {
+    return parent->allocate(length);
+  }
+  return uv_buf_init(static_cast<char*>(malloc(length)), length);
+}
+
+void fu::MonoSock::close(uv_handle_t* handle)
+{
+  delete handle;
+}
+
+bool fu::MonoSock::wrote(uv_write_t* writer, int status)
+{
+  return true;
+}
+
 bool fu::MonoSock::accept(int status)
 {
   std::cout << "accept" << std::endl;
@@ -170,34 +190,51 @@ bool fu::MonoSock::accept(int status)
   {
     return false;
   }*/
-  uv_tcp_t* acceptance = new uv_tcp_t();
-  uv_tcp_init(loop, acceptance);
-  int result = uv_accept((uv_stream_t*)tcp, (uv_stream_t*)acceptance);
-  if (result != 0)
+  uv_stream_t* acceptance = nullptr;
+  switch (protocol)
   {
-    uv_close((uv_handle_t*)acceptance, nullptr);
-    delete acceptance;
+    case Protocol::TCP:
+      acceptance = (uv_stream_t*)(new uv_tcp_t());
+      uv_tcp_init(loop, (uv_tcp_t*)acceptance);
+      break;
+  }
+  if (acceptance == nullptr)
+  {
     return false;
   }
-  tcpAccepts.push_back(acceptance);
+  acceptance->data = this;
+  int result = uv_accept((uv_stream_t*)tcp, acceptance);
+  if (result != 0)
+  {
+    uv_close((uv_handle_t*)acceptance, [](uv_handle_t* handle){static_cast<MonoSock*>(handle->data)->close(handle);});
+    return false;
+  }
   struct sockaddr_storage address;
   int length = sizeof(struct sockaddr_storage);
   memset(&address, 0, sizeof(struct sockaddr_storage));
-  result = uv_tcp_getpeername(acceptance, (struct sockaddr*)(&address), &length);
+  switch (protocol)
+  {
+  case Protocol::TCP:
+    result = uv_tcp_getpeername((uv_tcp_t*)acceptance, (struct sockaddr*)(&address), &length);
+    break;
+  default:
+    result = -1;
+    break;
+  }
   if (result != 0)
   {
-    uv_close((uv_handle_t*)acceptance, nullptr);
-    delete acceptance;
+    uv_close((uv_handle_t*)acceptance, [](uv_handle_t* handle){static_cast<MonoSock*>(handle->data)->close(handle);});
     return false;
   }
   bool success = establish(&address, status);
+  MonoSock* child = nullptr;
   if (success)
   {
     if (owner != nullptr)
     {
       std::cout << "child" << std::endl;
       int i = 0;
-      MonoSock* child = new MonoSock(Role::Server, protocol, port);
+      child = new MonoSock(Role::Server, protocol, port);
       child->isConnected = true;
       child->owner = owner;
       child->peer = peer;
@@ -205,7 +242,6 @@ bool fu::MonoSock::accept(int status)
       child->connectCallback = connectCallback;
       child->disconnectCallback = disconnectCallback;
       child->receiveCallback = receiveCallback;
-      children.push_back(child);
       for (;;)
       {
         i++;
@@ -217,6 +253,7 @@ bool fu::MonoSock::accept(int status)
         {
           if (child->owner == nullptr)
           {
+            success = false;
             break;
           }
         }
@@ -228,6 +265,54 @@ bool fu::MonoSock::accept(int status)
     std::cout << "reject" << std::endl;
   }
   peer = "0.0.0.0";
+  if (child != nullptr)
+  {
+    if (success)
+    {
+      acceptance->data = child;
+    }
+    else
+    {
+      acceptance->data = this;
+      delete child;
+      child = nullptr;
+    }
+  }
+  if (success)
+  {
+    int result = 0;
+    switch (protocol)
+    {
+    case Protocol::TCP:
+      result = uv_read_start(acceptance,
+                             [](uv_handle_t* handle, size_t length, uv_buf_t* buffer){*buffer = static_cast<MonoSock*>(handle->data)->allocate(length);},
+                             [](uv_stream_t* stream, ssize_t length, const uv_buf_t* buffer){static_cast<MonoSock*>(stream->data)->receive(reinterpret_cast<const uint8_t*>(buffer->base), length);});
+      break;
+    default:
+      result = -1;
+      break;
+    }
+    if (result != 0)
+    {
+      return false;
+    }
+  }
+  if (!success)
+  {
+    acceptance->data = this;
+    delete child;
+    child = nullptr;
+    uv_close((uv_handle_t*)acceptance, [](uv_handle_t* handle){static_cast<MonoSock*>(handle->data)->close(handle);});
+    return false;
+  }
+  children.push_back(child);
+  switch (protocol)
+  {
+  case Protocol::TCP:
+    child->index = tcpAccepts.size();
+    tcpAccepts.push_back((uv_tcp_t*)acceptance);
+    break;
+  }
   return success;
 }
 
@@ -245,7 +330,7 @@ bool fu::MonoSock::establish(const std::string& address, int status)
   }*/
   peer = address;
   std::cout << address << std::endl;
-  if (connectCallback(address))
+  if (connectCallback(this, address))
   {
     if (role != Role::Listener)
     {
@@ -304,6 +389,25 @@ bool fu::MonoSock::idle()
   threads->enqueue(1, "Read", [this](){read();});
   threads->enqueue(2, "Write", [this](){write();});
   std::cout << "idle" << std::endl;
+  if (role == Role::Client)
+  {
+    int result = 0;
+    switch (protocol)
+    {
+    case Protocol::TCP:
+      result = uv_read_start((uv_stream_t*)tcp,
+                             [](uv_handle_t* handle, size_t length, uv_buf_t* buffer){*buffer = static_cast<MonoSock*>(handle->data)->allocate(length);},
+                             [](uv_stream_t* stream, ssize_t length, const uv_buf_t* buffer){static_cast<MonoSock*>(stream->data)->receive(reinterpret_cast<const uint8_t*>(buffer->base), length);});
+      break;
+    default:
+      result = -1;
+      break;
+    }
+    if (result != 0)
+    {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -340,9 +444,35 @@ void fu::MonoSock::write()
   }
 }
 
+bool fu::MonoSock::receive(const uint8_t* bytes, ssize_t length)
+{
+  receiveCallback(this, bytes, length);
+  return true;
+}
+
 bool fu::MonoSock::send(const uint8_t* bytes, size_t length)
 {
-  std::cout << std::string(reinterpret_cast<const char*>(bytes), length) << std::endl;
+  uv_write_t* writer = (uv_write_t *)malloc(sizeof(uv_write_t));
+  uv_buf_t buffer = allocate(length);
+  memcpy(buffer.base, reinterpret_cast<const char*>(bytes), length);
+  int result = -1;
+  switch (protocol)
+  {
+  case Protocol::TCP:
+    if (tcp != nullptr)
+    {
+      result = uv_write(writer, (uv_stream_t*)tcp, &buffer, 1, [](uv_write_t* writer, int status){static_cast<MonoSock*>(writer->handle->data)->wrote(writer, status);});
+    }
+    else
+    {
+      if ((parent != nullptr) && (index > -1))
+      {
+        result = uv_write(writer, (uv_stream_t*)parent->tcpAccepts[index], &buffer, 1, [](uv_write_t* writer, int status){static_cast<MonoSock*>(writer->handle->data)->wrote(writer, status);});
+      }
+    }
+    break;
+  }
+  free(buffer.base);
   return true;
 }
 
