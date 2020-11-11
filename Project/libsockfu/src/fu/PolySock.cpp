@@ -13,12 +13,25 @@ fu::PolySock::PolySock() :
 fu::PolySock::~PolySock()
 {
   stop();
-  for (auto i = socks.begin(); i != socks.end(); i++)
   {
-    delete i->second;
+    std::unique_lock<std::mutex> lock(mutex);
+    for (auto i = socks.begin(); i != socks.end(); i++)
+    {
+      i->second->kill();
+    }
+    socks.clear();
   }
-  socks.clear();
   delete threads;
+}
+
+bool fu::PolySock::getIsStarted() const
+{
+  bool isStarted;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    isStarted = this->isStarted;
+  }
+  return isStarted;
 }
 
 bool fu::PolySock::start(MonoSock* sock)
@@ -31,12 +44,15 @@ bool fu::PolySock::start(MonoSock* sock)
   switch (sock->role)
   {
   case MonoSock::Role::Listener:
+    std::cout << "listener" << std::endl;
     success = sock->listen();
     break;
   case MonoSock::Role::Client:
+    std::cout << "client" << std::endl;
     success = sock->connect();
     break;
   case MonoSock::Role::Server:
+    std::cout << "server" << std::endl;
     success = sock->idle();
     break;
   }
@@ -54,12 +70,12 @@ bool fu::PolySock::stop(MonoSock* sock)
 
 bool fu::PolySock::start()
 {
-  if (isStarted)
+  if (getIsStarted())
   {
     return false;
   }
   isStarted = true;
-  threads->enqueue(0, "Run", [](PolySock* that){that->run();}, this);
+  threads->enqueue(0, "Run", [](bool* result, PolySock* that){*result = true;that->run();return 0;}, this);
   for (auto i = socks.begin(); i != socks.end(); i++)
   {
     if (i->second->role == MonoSock::Role::Server)
@@ -77,12 +93,20 @@ bool fu::PolySock::start()
 
 bool fu::PolySock::stop()
 {
-  condition.notify_all();
+  bool isStarted;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    isStarted = this->isStarted;
+    if (isStarted)
+    {
+      condition.notify_all();
+      this->isStarted = false;
+    }
+  }
   if (!isStarted)
   {
     return false;
   }
-  isStarted = false;
   for (auto i = socks.begin(); i != socks.end(); i++)
   {
     stop(i->second);
@@ -92,42 +116,60 @@ bool fu::PolySock::stop()
 
 void fu::PolySock::wait()
 {
-  while (isStarted)
+  bool isWaiting = true;
+  while (isWaiting)
   {
-    //std::cout << "wait" << std::endl;
-    std::chrono::milliseconds timespan(100);
     std::unique_lock<std::mutex> lock(mutex);
-    condition.wait(lock, [this]{return !this->isStarted;});
-    if (!isStarted)
+    if (isStarted)
     {
-      break;
+      std::chrono::milliseconds timespan(100);
+      condition.wait_for(lock, timespan);
+      if (!isStarted)
+      {
+        isWaiting = false;
+      }
     }
-    //std::this_thread::sleep_for(timespan);
+    else
+    {
+      isWaiting = false;
+    }
   }
 }
 
 void fu::PolySock::run()
 {
-  while (isStarted)
+  bool isRunning = true;
+  while (isRunning)
   {
-    //std::cout << "run" << std::endl;
-    std::chrono::milliseconds timespan(100);
-    if (socks.empty())
+    bool isEmpty = false;
     {
-      stop();
-      break;
+      std::unique_lock<std::mutex> lock(mutex);
+      if (socks.empty())
+      {
+        isEmpty = true;
+      }
     }
-    //std::this_thread::sleep_for(timespan);
+    if (isEmpty)
+    {
+      isRunning = false;
+    }
+    else
+    {
+      std::chrono::milliseconds timespan(100);
+      std::this_thread::sleep_for(timespan);
+    }
   }
+  stop();
 }
 
 bool fu::PolySock::push(int tag, MonoSock* sock)
 {
-  std::cout << "push" << std::endl;
+  std::cout << "push " << tag << std::endl;
   if (sock == nullptr)
   {
     return false;
   }
+  std::unique_lock<std::mutex> lock(mutex);
   auto i = socks.find(tag);
   if (i != socks.end())
   {
@@ -153,6 +195,7 @@ bool fu::PolySock::pop(MonoSock* sock)
   {
     return false;
   }
+  std::unique_lock<std::mutex> lock(mutex);
   auto i = socks.find(sock->tag);
   if (i == socks.end())
   {
@@ -165,6 +208,7 @@ bool fu::PolySock::pop(MonoSock* sock)
 
 fu::MonoSock* fu::PolySock::pop(int tag)
 {
+  std::unique_lock<std::mutex> lock(mutex);
   auto i = socks.find(tag);
   if (i == socks.end())
   {
@@ -179,14 +223,23 @@ fu::MonoSock* fu::PolySock::pop(int tag)
 void fu::PolySock::pop()
 {
   std::cout << "pop" << std::endl;
-  condition.notify_all();
+  std::unique_lock<std::mutex> lock(mutex);
   while (!socks.empty())
   {
-    MonoSock* sock = pop(socks.begin()->first);
+    MonoSock* sock = socks.begin()->second;
     if (sock != nullptr)
     {
+      sock->owner = nullptr;
       stop(sock);
-      delete sock;
+      sock->kill();
     }
+    socks.erase(socks.begin());
   }
+  condition.notify_all();
+}
+
+void fu::PolySock::kill()
+{
+  ThreadPool* pool = new ThreadPool(1);
+  pool->enqueue(0, "Kill", [=](bool* result){*result = false;delete this;return 0;});
 }

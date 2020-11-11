@@ -46,7 +46,7 @@ THIS IS AN ALTERED SOURCE VERSION!!!
 
 namespace fu
 {
-    template <class T, template <class U, class V = std::allocator<U>> class W>
+    template <typename T, template <typename U, typename V = std::allocator<U>> typename W>
     class GuardedSequence
     {
         public:
@@ -98,7 +98,7 @@ namespace fu
             }
             void sort(std::function<bool(T*,T*)> comparison)
             {
-                std::sort(container.begin(),container.end(),comparison);
+                std::sort(container.begin(), container.end(), comparison);
             }
             bool empty() const
             {
@@ -140,7 +140,7 @@ namespace fu
                 }
                 if (subinsert(value))
                 {
-                    container.insert(container.begin()+index,value);
+                    container.insert(container.begin()+index, value);
                     onAdd(value);
                     return true;
                 }
@@ -270,8 +270,7 @@ namespace fu
     class Task
     {
         public:
-            template <typename ...Args>
-            Task(unsigned int priority, const std::string& name, Args&& ...args) : priority(priority), name(name), task(std::function<void()>(std::forward<Args>(args)...)) {}
+            Task(unsigned int priority, const std::string& name) : priority(priority), name(name), task([](){}) {}
             unsigned int getPriority() const
             {
                 return priority;
@@ -281,12 +280,13 @@ namespace fu
                 return name;
             }
             std::function<void()> task;
+            bool result;
         private:
             unsigned int priority;
             std::string name;
     };
 
-    template <class T>
+    template <typename T>
     class ThreadPoolBase : public GuardedSequence<T, std::vector>
     {
         public:
@@ -296,43 +296,69 @@ namespace fu
             {
                 for (unsigned int i = 0; i != threadCount; ++i)
                 {
-                    workers.emplace_back(
-                        [this]
+                    workers.emplace_back([this]
+                    {
+                        bool isWorking = true;
+                        while (isWorking)
                         {
-                            while (true)
+                            Task* task = nullptr;
                             {
-                                Task* task = nullptr;
+                                std::chrono::milliseconds timespan(100);
+                                std::unique_lock<std::mutex> lock(this->queueMutex);
+                                this->queueCondition.wait_for(lock, timespan);
+                                if (!this->isStopped)
                                 {
-                                    std::unique_lock<std::mutex> lock(this->queueMutex);
-                                    this->condition.wait(lock,[this]{return ((this->isStopped) || (!this->empty()));});
-                                    if ((this->isStopped) && (this->empty()))
-                                    {
-                                        return;
-                                    }
-                                    task = this->getFirst();
+                                    task = this->getLast();
                                     bool temp = this->getIsResponsible();
                                     this->setIsResponsible(false);
                                     this->pop();
                                     this->setIsResponsible(temp);
                                 }
-                                if (task != nullptr)
+                                else
                                 {
-                                    std::cout << task->getName() << std::endl;
-                                    task->task();
-                                    delete task;
+                                    isWorking = false;
+                                }
+                            }
+                            if (task != nullptr)
+                            {
+                                //std::cout << task->getName() << std::endl;
+                                task->task();
+                                bool result = task->result;
+                                delete task;
+                                if (!result)
+                                {
+                                    std::unique_lock<std::mutex> lock(this->queueMutex);
+                                    for (unsigned int i = 0; i != this->workers.size(); ++i)
+                                    {
+                                        if (std::this_thread::get_id() == this->workers[i].get_id())
+                                        {
+                                            //std::cout << "hello" << std::endl;
+                                            this->workers[i].detach();
+                                            this->workers.erase(this->workers.begin()+i);
+                                            if ((this->workers.empty()) && (this->empty()))
+                                            {
+                                                task = nullptr;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (task == nullptr)
+                                {
+                                    delete this;
+                                    isWorking = false;
                                 }
                             }
                         }
-                    );
+                    });
                 }
             }
             virtual ~ThreadPoolBase()
             {
-                {
-                    std::unique_lock<std::mutex> lock(queueMutex);
-                    isStopped = true;
-                }
-                condition.notify_all();
+                //std::cout << "pool" << std::endl;
+                std::unique_lock<std::mutex> lock(queueMutex);
+                isStopped = true;
+                queueCondition.notify_all();
                 for (unsigned int i = 0; i != workers.size(); ++i)
                 {
                     if (std::this_thread::get_id() == workers[i].get_id())
@@ -343,16 +369,21 @@ namespace fu
                     {
                         workers[i].join();
                     }
+                    //std::cout << i << std::endl;
                 }
+                workers.clear();
                 this->purge();
             }
-            template<class F, class... Args>
-            auto enqueue(unsigned int priority, const std::string& name, F&& f, Args&&... args)
-                -> std::future<typename std::result_of<F(Args...)>::type>
+            template<typename Func, typename... Args>
+            auto enqueue(unsigned int priority, const std::string& name, Func&& func, Args&&... args)
+                -> std::future<typename std::result_of<Func(bool*, Args...)>::type>
             {
-                using returnType = typename std::result_of<F(Args...)>::type;
-                auto task = std::make_shared<std::packaged_task<returnType()>>(std::bind(std::forward<F>(f),std::forward<Args>(args)...));
-                std::future<returnType> result = task->get_future();
+                using returnType = typename std::result_of<Func(bool*, Args...)>::type;
+                Task* task = new T(priority, name);
+                auto binding = std::bind(std::forward<Func>(func), std::forward<bool*>(&task->result), std::forward<Args>(args)...);
+                auto package = std::make_shared<std::packaged_task<returnType()>>(binding);
+                task->task = [=](){try{(*package)();}catch(...){}};
+                std::future<returnType> result = package->get_future();
                 {
                     std::unique_lock<std::mutex> lock(queueMutex);
                     if (isStopped)
@@ -360,19 +391,19 @@ namespace fu
                         std::string error = "ERROR: Cannot enqueue on a Thread Pool which has already been shut down!";
                         throw std::runtime_error(error);
                     }
-                    this->push(new T(priority,name,[task]{(*task)();}));
+                    this->push(task);
+                    queueCondition.notify_one();
                 }
-                condition.notify_one();
                 return result;
             }
             void onAdd(T* value)
             {
-                this->sort([](T* t1, T* t2){return (t1->getPriority() < t2->getPriority());});
+                this->sort([](T* left, T* right){return (left->getPriority() > right->getPriority());});
             }
         private:
             std::vector<std::thread> workers;
             std::mutex queueMutex;
-            std::condition_variable condition;
+            std::condition_variable queueCondition;
             bool isStopped;
     };
 

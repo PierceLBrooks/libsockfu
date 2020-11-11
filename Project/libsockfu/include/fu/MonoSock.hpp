@@ -31,12 +31,13 @@ namespace fu
         UDP,
       };
       MonoSock(Role role, Protocol protocol, int port);
-      virtual ~MonoSock();
+      bool getIsIdle() const;
       bool disconnect();
       bool connect();
       bool listen();
       bool receive(const uint8_t* bytes, ssize_t length);
       bool send(const uint8_t* bytes, size_t length);
+      void kill();
       void setDisconnectCallback(DisconnectCallback callback);
       void setConnectCallback(ConnectCallback callback);
       void setReceiveCallback(ReceiveCallback callback);
@@ -63,13 +64,18 @@ namespace fu
       uv_connect_t* connection;
       std::condition_variable conditionRead;
       std::condition_variable conditionWrite;
-      std::mutex mutexWrite;
-      std::mutex mutexRead;
+      mutable std::mutex mutexGlobal;
+      mutable std::mutex mutexWrite;
+      mutable std::mutex mutexRead;
     protected:
+      virtual ~MonoSock();
       uv_buf_t allocate(size_t length);
       std::string peer;
-      std::vector<uv_tcp_t*> tcpAccepts;
       std::vector<MonoSock*> children;
+      std::vector<uv_tcp_t*> tcpAccepts;
+      std::vector<std::pair<uv_write_t*, uv_buf_t>> writers;
+      std::vector<uv_buf_t> receives;
+      std::vector<uv_buf_t> sends;
       MonoSock* parent;
       PolySock* owner;
       ThreadPool* threads;

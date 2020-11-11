@@ -27,6 +27,16 @@ fu::MonoSock::MonoSock(Role role, Protocol protocol, int port) :
   receiveCallback = [](MonoSock* sock, const uint8_t* bytes, size_t length){};
 }
 
+bool fu::MonoSock::getIsIdle() const
+{
+  bool isIdle;
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    isIdle = this->isIdle;
+  }
+  return isIdle;
+}
+
 fu::MonoSock::~MonoSock()
 {
   disconnect();
@@ -39,14 +49,53 @@ bool fu::MonoSock::disconnect()
   {
     return false;
   }
+  std::cout << "disconnect" << std::endl;
   isConnected = false;
-  isIdle = false;
-  conditionRead.notify_all();
-  conditionWrite.notify_all();
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    isIdle = false;
+  }
+  {
+    std::unique_lock<std::mutex> lock(mutexRead);
+    for (auto i = receives.begin(); i != receives.end(); i++)
+    {
+      free(i->base);
+    }
+    receives.clear();
+    conditionRead.notify_all();
+  }
+  {
+    std::unique_lock<std::mutex> lock(mutexWrite);
+    for (auto i = sends.begin(); i != sends.end(); i++)
+    {
+      free(i->base);
+    }
+    sends.clear();
+    conditionWrite.notify_all();
+  }
+  for (;;)
+  {
+    bool isWriting = false;
+    {
+      std::unique_lock<std::mutex> lock(mutexWrite);
+      if (!writers.empty())
+      {
+        isWriting = true;
+      }
+    }
+    if (!isWriting)
+    {
+      break;
+    }
+    std::chrono::milliseconds timespan(100);
+    std::this_thread::sleep_for(timespan);
+  }
   if (loop != nullptr)
   {
     uv_stop(loop);
     loop = nullptr;
+    std::chrono::milliseconds timespan(100);
+    std::this_thread::sleep_for(timespan);
   }
   for (auto i = tcpAccepts.begin(); i != tcpAccepts.end(); i++)
   {
@@ -111,7 +160,7 @@ MonoSock_connect_END:
     return false;
   }
   std::cout << "connect" << std::endl;
-  threads->enqueue(0, "Connect", [](uv_loop_t* loop){uv_run(loop, UV_RUN_DEFAULT);}, loop);
+  threads->enqueue(0, "Connect", [](bool* result, uv_loop_t* loop){*result = true;uv_run(loop, UV_RUN_DEFAULT);return 0;}, loop);
   return true;
 }
 
@@ -160,12 +209,16 @@ MonoSock_listen_END:
     return false;
   }
   std::cout << "listen" << std::endl;
-  threads->enqueue(0, "Listen", [](uv_loop_t* loop){uv_run(loop, UV_RUN_DEFAULT);}, loop);
+  threads->enqueue(0, "Listen", [](bool* result, uv_loop_t* loop){*result = true;uv_run(loop, UV_RUN_DEFAULT);return 0;}, loop);
   return true;
 }
 
 uv_buf_t fu::MonoSock::allocate(size_t length)
 {
+  if (length == 0)
+  {
+    return uv_buf_init(nullptr, 0);
+  }
   if (parent != nullptr)
   {
     return parent->allocate(length);
@@ -180,16 +233,40 @@ void fu::MonoSock::close(uv_handle_t* handle)
 
 bool fu::MonoSock::wrote(uv_write_t* writer, int status)
 {
+  bool success = false;
+  {
+    std::unique_lock<std::mutex> lock(mutexWrite);
+    for (auto i = writers.begin(); i != writers.end(); i++)
+    {
+      if (i->first == writer)
+      {
+        std::cout << "wrote" << std::endl;
+        success = true;
+        delete i->first;
+        free(i->second.base);
+        writers.erase(i);
+        break;
+      }
+    }
+  }
+  if (status != 0)
+  {
+    return false;
+  }
+  if (!success)
+  {
+    return false;
+  }
   return true;
 }
 
 bool fu::MonoSock::accept(int status)
 {
   std::cout << "accept" << std::endl;
-  /*if (status != 0)
+  if (status != 0)
   {
     return false;
-  }*/
+  }
   uv_stream_t* acceptance = nullptr;
   switch (protocol)
   {
@@ -244,6 +321,7 @@ bool fu::MonoSock::accept(int status)
       child->receiveCallback = receiveCallback;
       for (;;)
       {
+        std::cout << i << std::endl;
         i++;
         if (owner->push(tag+i, child))
         {
@@ -251,6 +329,7 @@ bool fu::MonoSock::accept(int status)
         }
         else
         {
+          std::cout << "fail" << std::endl;
           if (child->owner == nullptr)
           {
             success = false;
@@ -286,7 +365,7 @@ bool fu::MonoSock::accept(int status)
     case Protocol::TCP:
       result = uv_read_start(acceptance,
                              [](uv_handle_t* handle, size_t length, uv_buf_t* buffer){*buffer = static_cast<MonoSock*>(handle->data)->allocate(length);},
-                             [](uv_stream_t* stream, ssize_t length, const uv_buf_t* buffer){static_cast<MonoSock*>(stream->data)->receive(reinterpret_cast<const uint8_t*>(buffer->base), length);});
+                             [](uv_stream_t* stream, ssize_t length, const uv_buf_t* buffer){static_cast<MonoSock*>(stream->data)->receive(reinterpret_cast<const uint8_t*>(buffer->base), length);free(buffer->base);});
       break;
     default:
       result = -1;
@@ -381,13 +460,25 @@ bool fu::MonoSock::idle()
   {
     return false;
   }
+  if (role == Role::Listener)
+  {
+    return false;
+  }
+  bool isIdle;
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    isIdle = this->isIdle;
+    if (!isIdle)
+    {
+      this->isIdle = true;
+    }
+  }
   if (isIdle)
   {
     return false;
   }
-  isIdle = true;
-  threads->enqueue(1, "Read", [this](){read();});
-  threads->enqueue(2, "Write", [this](){write();});
+  threads->enqueue(1, "Read", [this](bool* result){*result = true;this->read();return 0;});
+  threads->enqueue(2, "Write", [this](bool* result){*result = true;this->write();return 0;});
   std::cout << "idle" << std::endl;
   if (role == Role::Client)
   {
@@ -397,7 +488,7 @@ bool fu::MonoSock::idle()
     case Protocol::TCP:
       result = uv_read_start((uv_stream_t*)tcp,
                              [](uv_handle_t* handle, size_t length, uv_buf_t* buffer){*buffer = static_cast<MonoSock*>(handle->data)->allocate(length);},
-                             [](uv_stream_t* stream, ssize_t length, const uv_buf_t* buffer){static_cast<MonoSock*>(stream->data)->receive(reinterpret_cast<const uint8_t*>(buffer->base), length);});
+                             [](uv_stream_t* stream, ssize_t length, const uv_buf_t* buffer){static_cast<MonoSock*>(stream->data)->receive(reinterpret_cast<const uint8_t*>(buffer->base), length);free(buffer->base);});
       break;
     default:
       result = -1;
@@ -414,66 +505,165 @@ bool fu::MonoSock::idle()
 void fu::MonoSock::read()
 {
   std::cout << "read" << std::endl;
-  while (isIdle)
+  bool isReading = true;
+  while (isReading)
   {
-    std::chrono::milliseconds timespan(100);
-    std::unique_lock<std::mutex> lock(mutexRead);
-    conditionRead.wait(lock, [this]{return !this->isIdle;});
-    if (!isIdle)
+    std::vector<uv_buf_t> buffers;
     {
-      break;
+      std::unique_lock<std::mutex> lock(mutexRead);
+      if (getIsIdle())
+      {
+        if (receives.empty())
+        {
+          std::chrono::milliseconds timespan(100);
+          conditionRead.wait_for(lock, timespan);
+          if (!getIsIdle())
+          {
+            isReading = false;
+          }
+          else
+          {
+            buffers = receives;
+            receives.clear();
+          }
+        }
+        else
+        {
+          buffers = receives;
+          receives.clear();
+        }
+      }
+      else
+      {
+        isReading = false;
+      }
     }
-    //std::this_thread::sleep_for(timespan);
+    while (!buffers.empty())
+    {
+      if (isReading)
+      {
+        receiveCallback(this, reinterpret_cast<const uint8_t*>(buffers.front().base), buffers.front().len);
+      }
+      free(buffers.front().base);
+      buffers.erase(buffers.begin());
+    }
   }
-  std::cout << "done" << std::endl;
 }
 
 void fu::MonoSock::write()
 {
   std::cout << "write" << std::endl;
-  while (isIdle)
+  bool isWriting = true;
+  while (isWriting)
   {
-    std::chrono::milliseconds timespan(100);
-    std::unique_lock<std::mutex> lock(mutexWrite);
-    conditionWrite.wait(lock, [this]{return !this->isIdle;});
-    if (!isIdle)
+    std::vector<uv_buf_t> buffers;
     {
-      break;
+      std::unique_lock<std::mutex> lock(mutexWrite);
+      if (getIsIdle())
+      {
+        if (sends.empty())
+        {
+          std::chrono::milliseconds timespan(100);
+          conditionWrite.wait_for(lock, timespan);
+          if (!getIsIdle())
+          {
+            isWriting = false;
+          }
+          else
+          {
+            buffers = sends;
+            sends.clear();
+          }
+        }
+        else
+        {
+          buffers = sends;
+          sends.clear();
+        }
+      }
+      else
+      {
+        isWriting = false;
+      }
     }
-    //std::this_thread::sleep_for(timespan);
+    while (!buffers.empty())
+    {
+      if (isWriting)
+      {
+        int result = -1;
+        uv_write_t* writer = new uv_write_t();
+        {
+          std::unique_lock<std::mutex> lock(mutexWrite);
+          writers.push_back(std::pair<uv_write_t*, uv_buf_t>(writer, buffers.front()));
+        }
+        switch (protocol)
+        {
+        case Protocol::TCP:
+          if (tcp != nullptr)
+          {
+            result = uv_write(writer, (uv_stream_t*)tcp, &writers.back().second, 1, [](uv_write_t* writer, int status){static_cast<MonoSock*>(writer->handle->data)->wrote(writer, status);});
+          }
+          else
+          {
+            if ((parent != nullptr) && (index >= 0))
+            {
+              result = uv_write(writer, (uv_stream_t*)parent->tcpAccepts[index], &writers.back().second, 1, [](uv_write_t* writer, int status){static_cast<MonoSock*>(writer->handle->data)->wrote(writer, status);});
+            }
+          }
+          break;
+        }
+        if (result != 0)
+        {
+          std::unique_lock<std::mutex> lock(mutexWrite);
+          for (auto i = writers.begin(); i != writers.end(); i++)
+          {
+            if (i->first == writer)
+            {
+              delete i->first;
+              free(i->second.base);
+              writers.erase(i);
+              break;
+            }
+          }
+        }
+      }
+      buffers.erase(buffers.begin());
+    }
   }
 }
 
 bool fu::MonoSock::receive(const uint8_t* bytes, ssize_t length)
 {
-  receiveCallback(this, bytes, length);
+  if (length <= 0)
+  {
+    return false;
+  }
+  uv_buf_t buffer = allocate(length);
+  memcpy(buffer.base, reinterpret_cast<const char*>(bytes), length);
+  {
+    std::unique_lock<std::mutex> lock(mutexRead);
+    receives.push_back(buffer);
+    conditionRead.notify_all();
+  }
   return true;
 }
 
 bool fu::MonoSock::send(const uint8_t* bytes, size_t length)
 {
-  uv_write_t* writer = (uv_write_t *)malloc(sizeof(uv_write_t));
   uv_buf_t buffer = allocate(length);
   memcpy(buffer.base, reinterpret_cast<const char*>(bytes), length);
-  int result = -1;
-  switch (protocol)
   {
-  case Protocol::TCP:
-    if (tcp != nullptr)
-    {
-      result = uv_write(writer, (uv_stream_t*)tcp, &buffer, 1, [](uv_write_t* writer, int status){static_cast<MonoSock*>(writer->handle->data)->wrote(writer, status);});
-    }
-    else
-    {
-      if ((parent != nullptr) && (index > -1))
-      {
-        result = uv_write(writer, (uv_stream_t*)parent->tcpAccepts[index], &buffer, 1, [](uv_write_t* writer, int status){static_cast<MonoSock*>(writer->handle->data)->wrote(writer, status);});
-      }
-    }
-    break;
+    std::unique_lock<std::mutex> lock(mutexWrite);
+    sends.push_back(buffer);
+    conditionWrite.notify_all();
   }
-  free(buffer.base);
   return true;
+}
+
+void fu::MonoSock::kill()
+{
+  ThreadPool* pool = new ThreadPool(1);
+  pool->enqueue(0, "Kill", [=](bool* result){*result = false;delete this;return 0;});
 }
 
 void fu::MonoSock::setDisconnectCallback(DisconnectCallback callback)

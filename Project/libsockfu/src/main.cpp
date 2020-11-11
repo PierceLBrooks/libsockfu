@@ -49,7 +49,9 @@ int main()
   //poly->pop(monoSer);
   //delete monoCli;
   //delete monoSer;
-  delete poly;
+  poly->kill();
   poly = nullptr;
+  std::chrono::milliseconds timespan(2000);
+  std::this_thread::sleep_for(timespan);
   return 0;
 }
