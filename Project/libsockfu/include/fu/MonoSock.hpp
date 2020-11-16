@@ -31,6 +31,7 @@ namespace fu
         UDP,
       };
       MonoSock(Role role, Protocol protocol, int port);
+      bool getIsConnected() const;
       bool getIsIdle() const;
       bool disconnect();
       bool connect();
@@ -43,6 +44,8 @@ namespace fu
       void setReceiveCallback(ReceiveCallback callback);
     private:
       friend class PolySock;
+      void run();
+      void walk(uv_handle_t* handle);
       void close(uv_handle_t* handle);
       bool wrote(uv_write_t* writer, int status);
       bool accept(int status);
@@ -57,6 +60,9 @@ namespace fu
       int index;
       int tag;
       int port;
+      bool isRunning;
+      bool isReading;
+      bool isWriting;
       bool isConnected;
       bool isIdle;
       uv_tcp_t* tcp;

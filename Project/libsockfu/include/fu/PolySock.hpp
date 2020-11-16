@@ -13,6 +13,7 @@ namespace fu
   class PolySock
   {
     public:
+      typedef std::function<void()> Handler;
       PolySock();
       bool getIsStarted() const;
       void run();
@@ -24,6 +25,7 @@ namespace fu
       bool pop(MonoSock* sock);
       void pop();
       void kill();
+      void handle(Handler handler);
     private:
       bool start(MonoSock* sock);
       bool stop(MonoSock* sock);

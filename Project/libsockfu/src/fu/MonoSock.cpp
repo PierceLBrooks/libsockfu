@@ -11,7 +11,10 @@ fu::MonoSock::MonoSock(Role role, Protocol protocol, int port) :
   protocol(protocol),
   port(port),
   isConnected(false),
-  isIdle(false)
+  isIdle(false),
+  isWriting(false),
+  isReading(false),
+  isRunning(false)
 {
   threads = new ThreadPool(4);
   loop = nullptr;
@@ -27,6 +30,17 @@ fu::MonoSock::MonoSock(Role role, Protocol protocol, int port) :
   receiveCallback = [](MonoSock* sock, const uint8_t* bytes, size_t length){};
 }
 
+fu::MonoSock::~MonoSock()
+{
+  disconnect();
+  if (threads != nullptr)
+  {
+    threads->kill();
+    delete threads;
+    threads = nullptr;
+  }
+}
+
 bool fu::MonoSock::getIsIdle() const
 {
   bool isIdle;
@@ -37,23 +51,27 @@ bool fu::MonoSock::getIsIdle() const
   return isIdle;
 }
 
-fu::MonoSock::~MonoSock()
+bool fu::MonoSock::getIsConnected() const
 {
-  disconnect();
-  delete threads;
+  bool isConnected;
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    isConnected = this->isConnected;
+  }
+  return isConnected;
 }
 
 bool fu::MonoSock::disconnect()
 {
-  if (!isConnected)
+  if (!getIsConnected())
   {
     return false;
   }
-  std::cout << "disconnect" << std::endl;
-  isConnected = false;
+  std::cout << "disconnect" << tag << std::endl;
   {
     std::unique_lock<std::mutex> lock(mutexGlobal);
     isIdle = false;
+    isConnected = false;
   }
   {
     std::unique_lock<std::mutex> lock(mutexRead);
@@ -62,7 +80,10 @@ bool fu::MonoSock::disconnect()
       free(i->base);
     }
     receives.clear();
-    conditionRead.notify_all();
+    if (isReading)
+    {
+      conditionRead.notify_one();
+    }
   }
   {
     std::unique_lock<std::mutex> lock(mutexWrite);
@@ -71,59 +92,59 @@ bool fu::MonoSock::disconnect()
       free(i->base);
     }
     sends.clear();
-    conditionWrite.notify_all();
-  }
-  for (;;)
-  {
-    bool isWriting = false;
+    if (isWriting)
     {
-      std::unique_lock<std::mutex> lock(mutexWrite);
-      if (!writers.empty())
-      {
-        isWriting = true;
-      }
+      conditionWrite.notify_one();
     }
-    if (!isWriting)
-    {
-      break;
-    }
-    std::chrono::milliseconds timespan(100);
-    std::this_thread::sleep_for(timespan);
-  }
-  if (loop != nullptr)
-  {
-    uv_stop(loop);
-    loop = nullptr;
-    std::chrono::milliseconds timespan(100);
-    std::this_thread::sleep_for(timespan);
   }
   for (auto i = tcpAccepts.begin(); i != tcpAccepts.end(); i++)
   {
     uv_close((uv_handle_t*)(*i), [](uv_handle_t* handle){static_cast<MonoSock*>(handle->data)->close(handle);});
-    std::chrono::milliseconds timespan(100);
-    std::this_thread::sleep_for(timespan);
   }
   tcpAccepts.clear();
   if (tcp != nullptr)
   {
     uv_close((uv_handle_t*)tcp, [](uv_handle_t* handle){static_cast<MonoSock*>(handle->data)->close(handle);});
-    std::chrono::milliseconds timespan(100);
-    std::this_thread::sleep_for(timespan);
     tcp = nullptr;
   }
   if (connection != nullptr)
   {
-    std::chrono::milliseconds timespan(100);
-    std::this_thread::sleep_for(timespan);
     delete connection;
     connection = nullptr;
   }
+  if (loop != nullptr)
+  {
+    uv_stop(loop);
+    for (;;)
+    {
+      if (uv_loop_alive(loop) == 0)
+      {
+        if (uv_loop_close(loop) != UV_EBUSY)
+        {
+          break;
+        }
+      }
+      uv_walk(loop, [](uv_handle_t* handle, void* data){static_cast<MonoSock*>(handle->data)->walk(handle);}, nullptr);
+      bool isRunning;
+      {
+        std::unique_lock<std::mutex> lock(mutexGlobal);
+        isRunning = this->isRunning;
+      }
+      if (!isRunning)
+      {
+        int status = uv_run(loop, UV_RUN_NOWAIT);
+      }
+    }
+    delete loop;
+    loop = nullptr;
+  }
+  disconnectCallback(this);
   return true;
 }
 
 bool fu::MonoSock::connect()
 {
-  if (isConnected)
+  if (getIsConnected())
   {
     return false;
   }
@@ -131,12 +152,26 @@ bool fu::MonoSock::connect()
   {
     return false;
   }
-  isConnected = true;
-  loop = uv_default_loop();
-  struct sockaddr address;
-  uv_ip4_addr(peer.c_str(), port, (struct sockaddr_in*)(&address));
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    isConnected = true;
+  }
   bool success = true;
   int result = 0;
+  loop = new uv_loop_t();
+  result = uv_loop_init(loop);
+  if (result != 0)
+  {
+    success = false;
+    goto MonoSock_connect_END;
+  }
+  struct sockaddr address;
+  result = uv_ip4_addr(peer.c_str(), port, (struct sockaddr_in*)(&address));
+  if (result != 0)
+  {
+    success = false;
+    goto MonoSock_connect_END;
+  }
   switch (protocol)
   {
   case Protocol::TCP:
@@ -155,18 +190,21 @@ bool fu::MonoSock::connect()
 MonoSock_connect_END:
   if (!success)
   {
-    isConnected = false;
+    {
+      std::unique_lock<std::mutex> lock(mutexGlobal);
+      isConnected = false;
+    }
     disconnect();
     return false;
   }
   std::cout << "connect" << std::endl;
-  threads->enqueue(0, "Connect", [](bool* result, uv_loop_t* loop){*result = true;uv_run(loop, UV_RUN_DEFAULT);return 0;}, loop);
+  threads->enqueue(0, "Connect", [this](bool* result){*result = true;this->run();return 0;});
   return true;
 }
 
 bool fu::MonoSock::listen()
 {
-  if (isConnected)
+  if (getIsConnected())
   {
     return false;
   }
@@ -174,13 +212,27 @@ bool fu::MonoSock::listen()
   {
     return false;
   }
-  isConnected = true;
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    isConnected = true;
+   }
   peer = "0.0.0.0";
-  loop = uv_default_loop();
-  struct sockaddr address;
-  uv_ip4_addr(peer.c_str(), port, (struct sockaddr_in*)(&address));
   bool success = true;
   int result = 0;
+  loop = new uv_loop_t();
+  result = uv_loop_init(loop);
+  if (result != 0)
+  {
+    success = false;
+    goto MonoSock_listen_END;
+  }
+  struct sockaddr address;
+  result = uv_ip4_addr(peer.c_str(), port, (struct sockaddr_in*)(&address));
+  if (result != 0)
+  {
+    success = false;
+    goto MonoSock_listen_END;
+  }
   switch (protocol)
   {
   case Protocol::TCP:
@@ -204,12 +256,15 @@ bool fu::MonoSock::listen()
 MonoSock_listen_END:
   if (!success)
   {
-    isConnected = false;
+    {
+      std::unique_lock<std::mutex> lock(mutexGlobal);
+      isConnected = false;
+    }
     disconnect();
     return false;
   }
   std::cout << "listen" << std::endl;
-  threads->enqueue(0, "Listen", [](bool* result, uv_loop_t* loop){*result = true;uv_run(loop, UV_RUN_DEFAULT);return 0;}, loop);
+  threads->enqueue(0, "Listen", [this](bool* result){*result = true;this->run();return 0;});
   return true;
 }
 
@@ -226,9 +281,59 @@ uv_buf_t fu::MonoSock::allocate(size_t length)
   return uv_buf_init(static_cast<char*>(malloc(length)), length);
 }
 
+void fu::MonoSock::run()
+{
+  if (loop == nullptr)
+  {
+    return;
+  }
+  bool isRunning = true;
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    this->isRunning = true;
+    if (!isConnected)
+    {
+      isRunning = false;
+    }
+  }
+  while (isRunning)
+  {
+    int status = uv_run(loop, UV_RUN_NOWAIT);
+    {
+      std::unique_lock<std::mutex> lock(mutexGlobal);
+      if (!isConnected)
+      {
+        isRunning = false;
+      }
+    }
+  }
+  std::cout << "ran" << tag << std::endl;
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    this->isRunning = false;
+  }
+}
+
+void fu::MonoSock::walk(uv_handle_t* handle)
+{
+  if (uv_is_closing(handle) != 0)
+  {
+    return;
+  }
+  std::cout << "walk" << std::endl;
+  uv_close(handle, [](uv_handle_t* handle){static_cast<MonoSock*>(handle->data)->close(handle);});
+}
+
 void fu::MonoSock::close(uv_handle_t* handle)
 {
-  delete handle;
+  std::cout << "close" << std::endl;
+  switch (protocol)
+  {
+    case Protocol::TCP:
+      uv_tcp_t* tcp = (uv_tcp_t*)handle;
+      delete tcp;
+      break;
+  }
 }
 
 bool fu::MonoSock::wrote(uv_write_t* writer, int status)
@@ -448,7 +553,6 @@ bool fu::MonoSock::establish(const struct sockaddr_storage* address, int status)
   }
   else
   {
-    std::cout << "address" << address->ss_family << std::endl;
     return false;
   }
   return establish(std::string(ip), status);
@@ -467,10 +571,17 @@ bool fu::MonoSock::idle()
   bool isIdle;
   {
     std::unique_lock<std::mutex> lock(mutexGlobal);
-    isIdle = this->isIdle;
-    if (!isIdle)
+    if ((isReading) || (isWriting))
     {
-      this->isIdle = true;
+      isIdle = true;
+    }
+    else
+    {
+      isIdle = this->isIdle;
+      if (!isIdle)
+      {
+        this->isIdle = true;
+      }
     }
   }
   if (isIdle)
@@ -506,6 +617,10 @@ void fu::MonoSock::read()
 {
   std::cout << "read" << std::endl;
   bool isReading = true;
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    this->isReading = true;
+  }
   while (isReading)
   {
     std::vector<uv_buf_t> buffers;
@@ -515,8 +630,7 @@ void fu::MonoSock::read()
       {
         if (receives.empty())
         {
-          std::chrono::milliseconds timespan(100);
-          conditionRead.wait_for(lock, timespan);
+          conditionRead.wait(lock);
           if (!getIsIdle())
           {
             isReading = false;
@@ -548,12 +662,20 @@ void fu::MonoSock::read()
       buffers.erase(buffers.begin());
     }
   }
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    this->isReading = false;
+  }
 }
 
 void fu::MonoSock::write()
 {
   std::cout << "write" << std::endl;
   bool isWriting = true;
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    this->isWriting = true;
+  }
   while (isWriting)
   {
     std::vector<uv_buf_t> buffers;
@@ -563,8 +685,7 @@ void fu::MonoSock::write()
       {
         if (sends.empty())
         {
-          std::chrono::milliseconds timespan(100);
-          conditionWrite.wait_for(lock, timespan);
+          conditionWrite.wait(lock);
           if (!getIsIdle())
           {
             isWriting = false;
@@ -630,12 +751,20 @@ void fu::MonoSock::write()
       buffers.erase(buffers.begin());
     }
   }
+  {
+    std::unique_lock<std::mutex> lock(mutexGlobal);
+    this->isWriting = false;
+  }
 }
 
 bool fu::MonoSock::receive(const uint8_t* bytes, ssize_t length)
 {
   if (length <= 0)
   {
+    if (owner != nullptr)
+    {
+      owner->handle([this](){this->disconnect();});
+    }
     return false;
   }
   uv_buf_t buffer = allocate(length);
@@ -663,7 +792,7 @@ bool fu::MonoSock::send(const uint8_t* bytes, size_t length)
 void fu::MonoSock::kill()
 {
   ThreadPool* pool = new ThreadPool(1);
-  pool->enqueue(0, "Kill", [=](bool* result){*result = false;delete this;return 0;});
+  pool->enqueue(0, "KillMono", [=](bool* result){*result = false;delete this;return 0;});
 }
 
 void fu::MonoSock::setDisconnectCallback(DisconnectCallback callback)

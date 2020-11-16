@@ -198,6 +198,10 @@ namespace fu
             }
             bool pop()
             {
+                if (container.empty())
+                {
+                    return false;
+                }
                 T* temp = container.back();
                 if (subpop(temp))
                 {
@@ -291,7 +295,7 @@ namespace fu
     {
         public:
             ThreadPoolBase(unsigned int threadCount) :
-                GuardedSequence<T,std::vector>(true),
+                GuardedSequence<T,std::vector>(false),
                 isStopped(false)
             {
                 for (unsigned int i = 0; i != threadCount; ++i)
@@ -303,16 +307,19 @@ namespace fu
                         {
                             Task* task = nullptr;
                             {
-                                std::chrono::milliseconds timespan(100);
                                 std::unique_lock<std::mutex> lock(this->queueMutex);
-                                this->queueCondition.wait_for(lock, timespan);
                                 if (!this->isStopped)
                                 {
-                                    task = this->getLast();
-                                    bool temp = this->getIsResponsible();
-                                    this->setIsResponsible(false);
-                                    this->pop();
-                                    this->setIsResponsible(temp);
+                                    this->queueCondition.wait(lock);
+                                    if (!this->isStopped)
+                                    {
+                                        task = this->getLast();
+                                        this->pop();
+                                    }
+                                    else
+                                    {
+                                        isWorking = false;
+                                    }
                                 }
                                 else
                                 {
@@ -321,7 +328,7 @@ namespace fu
                             }
                             if (task != nullptr)
                             {
-                                //std::cout << task->getName() << std::endl;
+                                std::cout << task->getName() << std::endl;
                                 task->task();
                                 bool result = task->result;
                                 delete task;
@@ -332,7 +339,7 @@ namespace fu
                                     {
                                         if (std::this_thread::get_id() == this->workers[i].get_id())
                                         {
-                                            //std::cout << "hello" << std::endl;
+                                            std::cout << "hi" << std::endl;
                                             this->workers[i].detach();
                                             this->workers.erase(this->workers.begin()+i);
                                             if ((this->workers.empty()) && (this->empty()))
@@ -345,6 +352,7 @@ namespace fu
                                 }
                                 if (task == nullptr)
                                 {
+                                    this->kill();
                                     delete this;
                                     isWorking = false;
                                 }
@@ -353,7 +361,8 @@ namespace fu
                     });
                 }
             }
-            virtual ~ThreadPoolBase()
+            virtual ~ThreadPoolBase() {}
+            void kill()
             {
                 //std::cout << "pool" << std::endl;
                 std::unique_lock<std::mutex> lock(queueMutex);
@@ -367,9 +376,10 @@ namespace fu
                     }
                     else
                     {
+                        std::cout << "hello" << std::endl;
                         workers[i].join();
                     }
-                    //std::cout << i << std::endl;
+                    std::cout << i << std::endl;
                 }
                 workers.clear();
                 this->purge();
@@ -399,6 +409,13 @@ namespace fu
             void onAdd(T* value)
             {
                 this->sort([](T* left, T* right){return (left->getPriority() > right->getPriority());});
+            }
+            void onRemove(T* value)
+            {
+                if (isStopped)
+                {
+                    delete value;
+                }
             }
         private:
             std::vector<std::thread> workers;

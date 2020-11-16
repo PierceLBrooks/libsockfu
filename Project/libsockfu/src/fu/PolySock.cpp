@@ -7,7 +7,7 @@
 fu::PolySock::PolySock() :
   isStarted(false)
 {
-  threads = new ThreadPool(1);
+  threads = new ThreadPool(4);
 }
 
 fu::PolySock::~PolySock()
@@ -21,7 +21,12 @@ fu::PolySock::~PolySock()
     }
     socks.clear();
   }
-  delete threads;
+  if (threads != nullptr)
+  {
+    threads->kill();
+    delete threads;
+    threads = nullptr;
+  }
 }
 
 bool fu::PolySock::getIsStarted() const
@@ -122,8 +127,7 @@ void fu::PolySock::wait()
     std::unique_lock<std::mutex> lock(mutex);
     if (isStarted)
     {
-      std::chrono::milliseconds timespan(100);
-      condition.wait_for(lock, timespan);
+      condition.wait(lock);
       if (!isStarted)
       {
         isWaiting = false;
@@ -242,4 +246,9 @@ void fu::PolySock::kill()
 {
   ThreadPool* pool = new ThreadPool(1);
   pool->enqueue(0, "Kill", [=](bool* result){*result = false;delete this;return 0;});
+}
+
+void fu::PolySock::handle(Handler handler)
+{
+  threads->enqueue(1, "Handle", [=](bool* result){*result = true;handler();return 0;});
 }
